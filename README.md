@@ -76,15 +76,15 @@ Models are defined in dictionary mappings at the top of the file:
 
 ```python
 ANTHROPIC_MODELS = {
-    "Claude-4.1-Opus": "claude-opus-4-1-20250805",
+    "Claude-4.5-Opus": "claude-opus-4-5",
     "Claude-4.5-Sonnet": "claude-sonnet-4-5",
     # ... more models
 }
 
 OPENAI_MODELS = {
-    "OpenAI-GPT-5": "gpt-5",
+    "OpenAI-GPT-5.2": "gpt-5.2",
+    "OpenAI-GPT-5-mini": "gpt-5-mini",
     "OpenAI-GPT-4.1": "gpt-4.1-2025-04-14",
-    "OpenAI-Reasoning-o4-mini": "o4-mini",
     # ... more models
 }
 ```

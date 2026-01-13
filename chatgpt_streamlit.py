@@ -19,19 +19,42 @@ from tavily import TavilyClient
 
 # Model name mappings
 ANTHROPIC_MODELS = {
-    "Claude-4.1-Opus": "claude-opus-4-1-20250805",
+    "Claude-4.5-Opus": "claude-opus-4-5",
     "Claude-4.5-Sonnet": "claude-sonnet-4-5",
 }
 
 OPENAI_MODELS = {
-    "OpenAI-GPT-5": "gpt-5",
+    "OpenAI-GPT-5.2": "gpt-5.2",
+    "OpenAI-GPT-5-mini": "gpt-5-mini",
     "OpenAI-GPT-4.1": "gpt-4.1-2025-04-14",
-    "OpenAI-Reasoning-o4-mini": "o4-mini",
 }
 
 # File type mappings
 IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "gif", "webp"}
 TEXT_EXTENSIONS = {"txt", "md", "csv"}
+
+
+def get_openai_reasoning_effort(user_effort: str) -> str:
+    """Map user-selected reasoning effort to OpenAI API value"""
+    mapping = {
+        "None": "none",
+        "Low": "low",
+        "Medium": "medium",
+        "High": "high",
+    }
+    return mapping.get(user_effort, "medium")
+
+
+def get_anthropic_reasoning_effort(user_effort: str) -> str:
+    """Map user-selected reasoning effort to Anthropic API value"""
+    # Anthropic: None->low, Low->medium, Medium->high, High->high
+    mapping = {
+        "None": "low",
+        "Low": "medium",
+        "Medium": "high",
+        "High": "high",
+    }
+    return mapping.get(user_effort, "medium")
 
 
 def init_page():
@@ -202,10 +225,10 @@ def select_model():
     ai_model = st.sidebar.radio(
         "Choose LLM:",
         (
-            "OpenAI-GPT-5",
+            "OpenAI-GPT-5.2",
+            "OpenAI-GPT-5-mini",
             "OpenAI-GPT-4.1",
-            "OpenAI-Reasoning-o4-mini",
-            "Claude-4.1-Opus",
+            "Claude-4.5-Opus",
             "Claude-4.5-Sonnet",
             "DeepSeek-R1",
         ),
@@ -222,6 +245,15 @@ def select_model():
     )
     st.session_state.enable_web_search = enable_web_search
 
+    # Reasoning effort selection
+    reasoning_effort = st.sidebar.radio(
+        "Reasoning Effort:",
+        ("None", "Low", "Medium", "High"),
+        index=1,  # Default to "Low"
+        help="Control the depth of reasoning. Higher effort = better quality but slower responses and more tokens.",
+    )
+    st.session_state.reasoning_effort = reasoning_effort
+
     # Show info about web search availability
     if enable_web_search:
         if ai_model.startswith("Claude"):
@@ -229,35 +261,70 @@ def select_model():
         elif ai_model.startswith("OpenAI"):
             st.sidebar.info("✅ Web search enabled via Tavily API")
 
-    if ai_model == "OpenAI-Reasoning-o4-mini":
-        return ChatOpenAI(
-            model=OPENAI_MODELS["OpenAI-Reasoning-o4-mini"],
-            use_responses_api=True,
-            max_completion_tokens=8192,
-            model_kwargs={
-                "reasoning": {
-                    "effort": "medium",  # 'low', 'medium', or 'high'
-                    "summary": "auto",  # 'detailed', 'auto', or None
-                },
-            },
-        )
-    elif ai_model in OPENAI_MODELS:
+    # Get reasoning effort from session state
+    reasoning_effort = st.session_state.get("reasoning_effort", "Low")
+
+    if ai_model in OPENAI_MODELS:
         model_name = OPENAI_MODELS[ai_model]
-        if ai_model == "OpenAI-GPT-5":
-            return ChatOpenAI(model_name=model_name)
+        openai_effort = get_openai_reasoning_effort(reasoning_effort)
+
+        if ai_model == "OpenAI-GPT-5.2":
+            # GPT-5.2 supports reasoning effort
+            if reasoning_effort != "None":
+                return ChatOpenAI(
+                    model_name=model_name,
+                    model_kwargs={
+                        "reasoning": {
+                            "effort": openai_effort,
+                            "summary": "auto",
+                        },
+                    },
+                )
+            else:
+                return ChatOpenAI(model_name=model_name)
+        elif ai_model == "OpenAI-GPT-5-mini":
+            # GPT-5-mini supports reasoning effort (if None selected, use "low")
+            effort_value = "low" if reasoning_effort == "None" else openai_effort
+            return ChatOpenAI(
+                model_name=model_name,
+                model_kwargs={
+                    "reasoning": {
+                        "effort": effort_value,
+                        "summary": "auto",
+                    },
+                },
+            )
         elif ai_model == "OpenAI-GPT-4.1":
             return ChatOpenAI(temperature=0.0, model_name=model_name)
     elif ai_model.startswith("Claude"):
         model_name = ANTHROPIC_MODELS.get(ai_model)
-        return ChatAnthropic(temperature=0.0, max_tokens=4096, model=model_name)
+        # Note: Effort parameter is only supported via native API (beta feature)
+        # LangChain wrapper doesn't support beta effort parameter, so we skip it here
+        # Effort will be applied when using native API (for file uploads/web search)
+        return ChatAnthropic(
+            temperature=0.0,
+            max_tokens=4096,
+            model=model_name,
+        )
     elif ai_model == "DeepSeek-R1":
+        # Get reasoning effort from session state
+        reasoning_effort = st.session_state.get("reasoning_effort", "Low")
+        # Map reasoning effort to Replicate format (if supported)
+        # DeepSeek-R1 may support reasoning_effort parameter
+        replicate_kwargs = {
+            "temperature": 0.0,
+            "max_new_tokens": 8192,
+            "top_p": 0.9,
+        }
+        # Add reasoning effort if model supports it
+        # Note: Check Replicate documentation for exact parameter name
+        if reasoning_effort != "None":
+            # Try reasoning_effort parameter (common for reasoning models on Replicate)
+            replicate_kwargs["reasoning_effort"] = reasoning_effort.lower()
+
         return Replicate(
             streaming=True,
-            model_kwargs={
-                "temperature": 0.0,
-                "max_new_tokens": 8192,
-                "top_p": 0.9,
-            },
+            model_kwargs=replicate_kwargs,
             model="deepseek-ai/deepseek-r1",
         )
 
@@ -338,6 +405,10 @@ def get_answer_anthropic_native(
         messages, pdf_contents, pdf_filenames, image_contents, image_mime_types
     )
 
+    # Get reasoning effort from session state
+    reasoning_effort = st.session_state.get("reasoning_effort", "Low")
+    anthropic_effort = get_anthropic_reasoning_effort(reasoning_effort)
+
     # Prepare request parameters
     request_params = {
         "model": model_name,
@@ -354,6 +425,25 @@ def get_answer_anthropic_native(
             {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}
         ]
 
+    # Add effort parameter using beta API
+    # Effort is a beta feature - try to use it, but fall back if not supported
+    use_beta_api = False
+    if (
+        anthropic_effort and anthropic_effort != "low"
+    ):  # Only use beta API for medium/high effort
+        try:
+            # Try beta API with effort parameter
+            request_params["betas"] = ["effort-2025-11-24"]
+            request_params["effort"] = anthropic_effort
+            use_beta_api = True
+        except Exception:
+            # If beta API setup fails, fall back to regular API
+            use_beta_api = False
+            if "betas" in request_params:
+                del request_params["betas"]
+            if "effort" in request_params:
+                del request_params["effort"]
+
     # Handle tool use loop - continue until we get final text response
     max_iterations = 10  # Prevent infinite loops
     iteration = 0
@@ -361,8 +451,27 @@ def get_answer_anthropic_native(
     while iteration < max_iterations:
         iteration += 1
 
-        # Make API call
-        response = client.messages.create(**request_params)
+        # Make API call - use beta API if effort is specified and supported
+        try:
+            if use_beta_api:
+                response = client.beta.messages.create(**request_params)
+            else:
+                response = client.messages.create(**request_params)
+        except TypeError as e:
+            # If beta API doesn't support effort parameter, fall back to regular API
+            if "effort" in str(e) or "output_config" in str(e):
+                if use_beta_api:
+                    # Remove effort-related parameters and retry with regular API
+                    request_params_fallback = request_params.copy()
+                    request_params_fallback.pop("betas", None)
+                    request_params_fallback.pop("effort", None)
+                    request_params_fallback.pop("output_config", None)
+                    response = client.messages.create(**request_params_fallback)
+                    use_beta_api = False  # Don't try beta API again
+                else:
+                    raise
+            else:
+                raise
 
         # First, extract only text content blocks (filter out all tool use and metadata)
         text_parts = []
@@ -378,9 +487,15 @@ def get_answer_anthropic_native(
                         text_parts.append(content_block.get("text", ""))
                     # Skip all other types
 
+        # Handle case where response might have text directly
+        if not text_parts and hasattr(response, "text"):
+            text_parts.append(response.text)
+
         # If we have text content, return it immediately (this is the final answer)
         if text_parts:
-            return "\n".join(text_parts)
+            # Join text parts and ensure proper markdown formatting
+            result = "\n".join(text_parts).strip()
+            return result if result else ""
 
         # If response stopped due to tool use, continue the conversation
         if response.stop_reason == "tool_use":
@@ -391,11 +506,16 @@ def get_answer_anthropic_native(
 
             # Update request_params to use updated messages for next iteration
             request_params["messages"] = anthropic_messages
+            # Ensure beta API and effort config are maintained for subsequent calls
+            if use_beta_api and "betas" not in request_params:
+                request_params["betas"] = ["effort-2025-11-24"]
+                request_params["effort"] = anthropic_effort
             continue
 
         # If we get here, no text content and not tool use - break
         break
 
+    # Return empty string if no response was generated
     return ""
 
 
@@ -461,14 +581,186 @@ def get_answer_openai_native(
         messages, file_ids, image_contents, image_mime_types
     )
 
+    # Get reasoning effort from session state
+    reasoning_effort = st.session_state.get("reasoning_effort", "Low")
+    openai_effort = get_openai_reasoning_effort(reasoning_effort)
+
     # Prepare request parameters
     request_params = {
         "model": model_name,
         "messages": openai_messages,
     }
 
-    if model_name != OPENAI_MODELS["OpenAI-GPT-5"]:
+    if model_name != OPENAI_MODELS["OpenAI-GPT-5.2"]:
         request_params["temperature"] = 0.0
+
+    # GPT-5-mini requires Responses API (not Chat Completions) for reasoning
+    if model_name == OPENAI_MODELS["OpenAI-GPT-5-mini"]:
+        # GPT-5-mini always uses reasoning - use Responses API
+        effort_value = "low" if reasoning_effort == "None" else openai_effort
+
+        # Convert messages to input format for Responses API
+        # Responses API accepts messages array similar to Chat Completions
+        # Convert to format: [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}, ...]
+        responses_input = []
+        for msg in openai_messages:
+            role = msg.get("role")
+            content = msg.get("content", "")
+
+            # Extract text from content if it's a list (e.g., with images/files)
+            if isinstance(content, list):
+                text_parts = []
+                for item in content:
+                    if isinstance(item, dict):
+                        if item.get("type") == "text" and "text" in item:
+                            text_parts.append(item["text"])
+                    elif isinstance(item, str):
+                        text_parts.append(item)
+                content = " ".join(text_parts) if text_parts else str(content)
+            elif not isinstance(content, str):
+                content = str(content)
+
+            # Skip system messages (Responses API may not support them directly)
+            if role == "system":
+                continue
+
+            # Add user and assistant messages
+            if role in ["user", "assistant"]:
+                responses_input.append({"role": role, "content": content})
+
+        if not responses_input:
+            return "Error: No messages found"
+
+        # Use Responses API for GPT-5-mini
+        try:
+            response = client.responses.create(
+                model=model_name,
+                input=responses_input,
+                reasoning={"effort": effort_value},
+                max_output_tokens=4096,
+            )
+
+            # Extract text from response - Responses API format
+            # Structure: response.output[0] -> ResponseOutputMessage -> content[0] -> ResponseOutputText -> text
+            if hasattr(response, "output") and response.output:
+                if isinstance(response.output, list) and len(response.output) > 0:
+                    # Find the message output (skip reasoning items)
+                    for output_item in response.output:
+                        # Check if it's a message type
+                        if (
+                            hasattr(output_item, "type")
+                            and output_item.type == "message"
+                        ):
+                            if hasattr(output_item, "content") and output_item.content:
+                                if isinstance(output_item.content, list):
+                                    # Extract text from all content items
+                                    text_parts = []
+                                    for content_item in output_item.content:
+                                        if (
+                                            hasattr(content_item, "type")
+                                            and content_item.type == "output_text"
+                                        ):
+                                            if hasattr(content_item, "text"):
+                                                text_parts.append(content_item.text)
+                                    if text_parts:
+                                        return "\n".join(text_parts)
+                                # Fallback: try direct text access
+                                elif hasattr(output_item.content, "text"):
+                                    return output_item.content.text
+                    # Fallback: try to find any text attribute in the output
+                    for output_item in response.output:
+                        if hasattr(output_item, "text"):
+                            return output_item.text
+            # Final fallback - return string representation
+            return str(response)
+        except Exception as e:
+            return f"Error calling Responses API: {str(e)}"
+
+    # GPT-5.2 requires Responses API when reasoning is enabled (similar to GPT-5-mini)
+    if model_name == OPENAI_MODELS["OpenAI-GPT-5.2"]:
+        if reasoning_effort != "None":
+            # GPT-5.2 with reasoning must use Responses API
+            effort_value = openai_effort
+
+            # Convert messages to input format for Responses API
+            # Responses API accepts messages array similar to Chat Completions
+            # Convert to format: [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}, ...]
+            responses_input = []
+            for msg in openai_messages:
+                role = msg.get("role")
+                content = msg.get("content", "")
+
+                # Extract text from content if it's a list (e.g., with images/files)
+                if isinstance(content, list):
+                    text_parts = []
+                    for item in content:
+                        if isinstance(item, dict):
+                            if item.get("type") == "text" and "text" in item:
+                                text_parts.append(item["text"])
+                        elif isinstance(item, str):
+                            text_parts.append(item)
+                    content = " ".join(text_parts) if text_parts else str(content)
+                elif not isinstance(content, str):
+                    content = str(content)
+
+                # Skip system messages (Responses API may not support them directly)
+                if role == "system":
+                    continue
+
+                # Add user and assistant messages
+                if role in ["user", "assistant"]:
+                    responses_input.append({"role": role, "content": content})
+
+            if not responses_input:
+                return "Error: No messages found"
+
+            # Use Responses API for GPT-5.2 with reasoning
+            try:
+                response = client.responses.create(
+                    model=model_name,
+                    input=responses_input,
+                    reasoning={"effort": effort_value},
+                    max_output_tokens=4096,
+                )
+
+                # Extract text from response - Responses API format
+                if hasattr(response, "output") and response.output:
+                    if isinstance(response.output, list) and len(response.output) > 0:
+                        # Find the message output (skip reasoning items)
+                        for output_item in response.output:
+                            # Check if it's a message type
+                            if (
+                                hasattr(output_item, "type")
+                                and output_item.type == "message"
+                            ):
+                                if (
+                                    hasattr(output_item, "content")
+                                    and output_item.content
+                                ):
+                                    if isinstance(output_item.content, list):
+                                        # Extract text from all content items
+                                        text_parts = []
+                                        for content_item in output_item.content:
+                                            if (
+                                                hasattr(content_item, "type")
+                                                and content_item.type == "output_text"
+                                            ):
+                                                if hasattr(content_item, "text"):
+                                                    text_parts.append(content_item.text)
+                                        if text_parts:
+                                            return "\n".join(text_parts)
+                                    # Fallback: try direct text access
+                                    elif hasattr(output_item.content, "text"):
+                                        return output_item.content.text
+                        # Fallback: try to find any text attribute in the output
+                        for output_item in response.output:
+                            if hasattr(output_item, "text"):
+                                return output_item.text
+                # Final fallback - return string representation
+                return str(response)
+            except Exception as e:
+                return f"Error calling Responses API: {str(e)}"
+        # If reasoning is None, continue with Chat Completions API below
 
     if enable_web_search:
         request_params["tools"] = [
@@ -504,7 +796,24 @@ def get_answer_openai_native(
 
         # If no tool calls, return the content
         if not message.tool_calls:
-            return message.content
+            # Handle different content formats
+            content = message.content
+            if isinstance(content, list):
+                # Extract text from content blocks (e.g., [{'type': 'text', 'text': '...'}])
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict):
+                        if block.get("type") == "text" and "text" in block:
+                            text_parts.append(block["text"])
+                        elif "text" in block:
+                            text_parts.append(block["text"])
+                    elif isinstance(block, str):
+                        text_parts.append(block)
+                return "\n".join(text_parts).strip() if text_parts else str(content)
+            elif isinstance(content, str):
+                return content.strip()
+            else:
+                return str(content).strip() if content else ""
 
         # Process tool calls
         openai_messages.append(message)
@@ -525,11 +834,27 @@ def get_answer_openai_native(
         request_params["messages"] = openai_messages
 
     # If we hit max iterations, return last message content
-    return (
-        message.content
-        if message.content
-        else "Unable to complete response after multiple tool calls."
-    )
+    if message.content:
+        # Handle different content formats
+        content = message.content
+        if isinstance(content, list):
+            # Extract text from content blocks
+            text_parts = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text" and "text" in block:
+                        text_parts.append(block["text"])
+                    elif "text" in block:
+                        text_parts.append(block["text"])
+                elif isinstance(block, str):
+                    text_parts.append(block)
+            return "\n".join(text_parts).strip() if text_parts else str(content)
+        elif isinstance(content, str):
+            return content.strip()
+        else:
+            return str(content).strip()
+    else:
+        return "Unable to complete response after multiple tool calls."
 
 
 def get_answer(llm, messages):
@@ -541,6 +866,19 @@ def get_answer(llm, messages):
     file_ids, pdf_contents, pdf_filenames, image_contents, image_mime_types = (
         get_file_attachments()
     )
+
+    # GPT-5-mini always uses native API (Responses API) since LangChain doesn't support it
+    if selected_model == "OpenAI-GPT-5-mini":
+        model_name = OPENAI_MODELS.get(selected_model)
+        if model_name:
+            return get_answer_openai_native(
+                messages,
+                model_name,
+                enable_web_search,
+                file_ids,
+                image_contents,
+                image_mime_types,
+            )
 
     # Use native SDK for web search or file handling
     if enable_web_search or file_ids or pdf_contents or image_contents:
@@ -571,7 +909,26 @@ def get_answer(llm, messages):
 
     # Default: use LangChain wrapper
     answer = llm.invoke(messages)
-    return answer if isinstance(llm, Replicate) else answer.text()
+
+    # Handle different output formats
+    if isinstance(llm, Replicate):
+        # Replicate models return text directly or as a generator
+        if isinstance(answer, str):
+            return answer.strip()
+        elif hasattr(answer, "__iter__") and not isinstance(answer, str):
+            # If it's a generator/stream, collect all chunks
+            return "".join(str(chunk) for chunk in answer).strip()
+        else:
+            return str(answer).strip()
+    else:
+        # LangChain ChatModel returns AIMessage with content attribute
+        if hasattr(answer, "content"):
+            result = answer.content
+            return result.strip() if isinstance(result, str) else str(result).strip()
+        elif isinstance(answer, str):
+            return answer.strip()
+        else:
+            return str(answer).strip()
 
 
 def process_image_file(uploaded_file, file_content, model_str, selected_model):

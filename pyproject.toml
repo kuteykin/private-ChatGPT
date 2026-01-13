@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "chatgpt"
-version = "0.1.1"
-description = "Interface for ChatGPT via OpenAI API"
+version = "0.3.4"
+description = "Interface for ChatGPT via foundational models API (OpenAI / Anthropic / Replicate"
 authors = ["Konstantin Kuteykin <konstantin.neurocreate@gmail.com>"]
 
 
