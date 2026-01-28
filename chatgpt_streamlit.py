@@ -550,6 +550,58 @@ def convert_messages_to_openai(
     return openai_messages
 
 
+def convert_chat_content_to_responses_format(content):
+    """Convert Chat Completions content format to Responses API format
+
+    Chat Completions uses: type: "text", "image_url", "file"
+    Responses API uses: type: "input_text", "input_image", "input_file"
+    """
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        converted = []
+        for item in content:
+            if isinstance(item, dict):
+                item_type = item.get("type")
+
+                # Convert text blocks
+                if item_type == "text":
+                    converted.append({
+                        "type": "input_text",
+                        "text": item.get("text", "")
+                    })
+
+                # Convert image_url blocks to input_image
+                elif item_type == "image_url":
+                    image_url = item.get("image_url", {})
+                    url = image_url.get("url", "") if isinstance(image_url, dict) else str(image_url)
+                    # Responses API expects input_image with image_url field
+                    converted.append({
+                        "type": "input_image",
+                        "image_url": url
+                    })
+
+                # Convert file blocks to input_file
+                elif item_type == "file":
+                    file_info = item.get("file", {})
+                    file_id = file_info.get("file_id", "") if isinstance(file_info, dict) else str(file_info)
+                    converted.append({
+                        "type": "input_file",
+                        "file_id": file_id
+                    })
+
+                # Keep other types as-is (shouldn't happen, but just in case)
+                else:
+                    converted.append(item)
+            else:
+                converted.append(item)
+
+        return converted if converted else content
+
+    return content
+
+
 def get_answer_openai_native(
     messages,
     model_name,
@@ -583,31 +635,20 @@ def get_answer_openai_native(
         effort_value = "low" if reasoning_effort == "None" else openai_effort
 
         # Convert messages to input format for Responses API
-        # Responses API accepts messages array similar to Chat Completions
-        # Convert to format: [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}, ...]
+        # Responses API uses different content type names than Chat Completions
         responses_input = []
         for msg in openai_messages:
             role = msg.get("role")
             content = msg.get("content", "")
 
-            # Extract text from content if it's a list (e.g., with images/files)
-            if isinstance(content, list):
-                text_parts = []
-                for item in content:
-                    if isinstance(item, dict):
-                        if item.get("type") == "text" and "text" in item:
-                            text_parts.append(item["text"])
-                    elif isinstance(item, str):
-                        text_parts.append(item)
-                content = " ".join(text_parts) if text_parts else str(content)
-            elif not isinstance(content, str):
-                content = str(content)
+            # Convert content from Chat Completions format to Responses API format
+            content = convert_chat_content_to_responses_format(content)
 
             # Skip system messages (Responses API may not support them directly)
             if role == "system":
                 continue
 
-            # Add user and assistant messages
+            # Add user and assistant messages with converted content
             if role in ["user", "assistant"]:
                 responses_input.append({"role": role, "content": content})
 
@@ -666,31 +707,20 @@ def get_answer_openai_native(
             effort_value = openai_effort
 
             # Convert messages to input format for Responses API
-            # Responses API accepts messages array similar to Chat Completions
-            # Convert to format: [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}, ...]
+            # Responses API uses different content type names than Chat Completions
             responses_input = []
             for msg in openai_messages:
                 role = msg.get("role")
                 content = msg.get("content", "")
 
-                # Extract text from content if it's a list (e.g., with images/files)
-                if isinstance(content, list):
-                    text_parts = []
-                    for item in content:
-                        if isinstance(item, dict):
-                            if item.get("type") == "text" and "text" in item:
-                                text_parts.append(item["text"])
-                        elif isinstance(item, str):
-                            text_parts.append(item)
-                    content = " ".join(text_parts) if text_parts else str(content)
-                elif not isinstance(content, str):
-                    content = str(content)
+                # Convert content from Chat Completions format to Responses API format
+                content = convert_chat_content_to_responses_format(content)
 
                 # Skip system messages (Responses API may not support them directly)
                 if role == "system":
                     continue
 
-                # Add user and assistant messages
+                # Add user and assistant messages with converted content
                 if role in ["user", "assistant"]:
                     responses_input.append({"role": role, "content": content})
 
@@ -961,6 +991,15 @@ def get_answer(llm, messages):
         get_file_attachments()
     )
 
+    # Show status message if files are attached
+    if file_ids or pdf_contents or image_contents:
+        file_count = (
+            len(file_ids or [])
+            + len(pdf_contents or [])
+            + len(image_contents or [])
+        )
+        st.info(f"📎 Sending {file_count} attached file(s) to {selected_model} for analysis...")
+
     # GPT-5-mini and GPT-5.2 with reasoning always use native API (Responses API) since LangChain doesn't support it
     reasoning_effort = st.session_state.get("reasoning_effort", "Low")
 
@@ -1113,21 +1152,6 @@ def process_pdf_file(uploaded_file, file_content, model_str, selected_model):
 
 def process_uploaded_files(uploaded_files, user_input, llm):
     """Process multiple uploaded files and return modified user input"""
-    if not uploaded_files:
-        # If no files but we had files before, clear them
-        if st.session_state.get("processed_files"):
-            st.session_state.last_file_ids = []
-            st.session_state.last_pdf_contents = []
-            st.session_state.last_pdf_filenames = []
-            st.session_state.last_image_contents = []
-            st.session_state.last_image_mime_types = []
-            st.session_state.last_images = []
-            st.session_state.processed_files = set()
-        return user_input
-
-    model_str = str(type(llm))
-    selected_model = st.session_state.get("selected_model")
-
     # Initialize session state for file tracking
     if "processed_files" not in st.session_state:
         st.session_state.processed_files = set()
@@ -1143,6 +1167,16 @@ def process_uploaded_files(uploaded_files, user_input, llm):
         st.session_state.last_image_mime_types = []
     if "last_images" not in st.session_state:
         st.session_state.last_images = []
+
+    # If no files uploaded, only clear if we explicitly had files before
+    # This allows files to persist across messages
+    if not uploaded_files:
+        # Don't auto-clear files - they should persist until conversation is cleared
+        # or user explicitly removes them from the uploader
+        return user_input
+
+    model_str = str(type(llm))
+    selected_model = st.session_state.get("selected_model")
 
     # Create a set of current file identifiers (name + size)
     current_file_ids = {(f.name, f.size) for f in uploaded_files}
@@ -1268,6 +1302,22 @@ def main():
         help="Upload documents or images to discuss with the AI",
         accept_multiple_files=True,
     )
+
+    # Display currently attached files in sidebar
+    if st.session_state.get("processed_files"):
+        st.sidebar.markdown("### 📎 Currently Attached Files")
+        file_names = [name for name, _ in st.session_state.processed_files]
+        for name in file_names:
+            st.sidebar.text(f"  • {name}")
+        if st.sidebar.button("Clear All Attachments"):
+            st.session_state.last_file_ids = []
+            st.session_state.last_pdf_contents = []
+            st.session_state.last_pdf_filenames = []
+            st.session_state.last_image_contents = []
+            st.session_state.last_image_mime_types = []
+            st.session_state.last_images = []
+            st.session_state.processed_files = set()
+            st.rerun()
 
     if user_input := st.chat_input("Input your question!"):
         # Process files if uploaded
