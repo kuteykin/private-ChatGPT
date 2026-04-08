@@ -3,7 +3,6 @@ from dotenv import load_dotenv
 import base64
 import tempfile
 import time
-import json
 import os
 import re
 
@@ -20,14 +19,13 @@ from tavily import TavilyClient
 
 # Model name mappings
 ANTHROPIC_MODELS = {
-    "Claude-4.5-Opus": "claude-opus-4-5",
-    "Claude-4.5-Sonnet": "claude-sonnet-4-5",
+    "Claude-4.6-Opus": "claude-opus-4-6",
+    "Claude-4.6-Sonnet": "claude-sonnet-4-6",
 }
 
 OPENAI_MODELS = {
-    "OpenAI-GPT-5.2": "gpt-5.2",
-    "OpenAI-GPT-5-mini": "gpt-5-mini",
-    "OpenAI-GPT-4.1": "gpt-4.1-2025-04-14",
+    "OpenAI-GPT-5.4": "gpt-5.4",
+    "OpenAI-GPT-5.4-mini": "gpt-5.4-mini",
 }
 
 # File type mappings
@@ -226,11 +224,10 @@ def select_model():
     ai_model = st.sidebar.radio(
         "Choose LLM:",
         (
-            "OpenAI-GPT-5.2",
-            "OpenAI-GPT-5-mini",
-            "OpenAI-GPT-4.1",
-            "Claude-4.5-Opus",
-            "Claude-4.5-Sonnet",
+            "OpenAI-GPT-5.4",
+            "OpenAI-GPT-5.4-mini",
+            "Claude-4.6-Opus",
+            "Claude-4.6-Sonnet",
             "DeepSeek-R1",
         ),
     )
@@ -269,16 +266,15 @@ def select_model():
         model_name = OPENAI_MODELS[ai_model]
         openai_effort = get_openai_reasoning_effort(reasoning_effort)
 
-        if ai_model == "OpenAI-GPT-5.2":
-            # GPT-5.2 without reasoning can use LangChain wrapper
+        if ai_model == "OpenAI-GPT-5.4":
+            # GPT-5.4 without reasoning can use LangChain wrapper
             # With reasoning, it will use native API (handled in get_answer function)
             return ChatOpenAI(model_name=model_name)
-        elif ai_model == "OpenAI-GPT-5-mini":
-            # GPT-5-mini always uses native API (Responses API) - this won't be used
+        elif ai_model == "OpenAI-GPT-5.4-mini":
+            # GPT-5.4-mini always uses native API (Responses API) - this won't be used
             # But we need to return something for LangChain compatibility
             return ChatOpenAI(model_name=model_name)
-        elif ai_model == "OpenAI-GPT-4.1":
-            return ChatOpenAI(temperature=0.0, model_name=model_name)
+
     elif ai_model.startswith("Claude"):
         model_name = ANTHROPIC_MODELS.get(ai_model)
         # Note: Effort parameter is only supported via native API (beta feature)
@@ -567,29 +563,30 @@ def convert_chat_content_to_responses_format(content):
 
                 # Convert text blocks
                 if item_type == "text":
-                    converted.append({
-                        "type": "input_text",
-                        "text": item.get("text", "")
-                    })
+                    converted.append(
+                        {"type": "input_text", "text": item.get("text", "")}
+                    )
 
                 # Convert image_url blocks to input_image
                 elif item_type == "image_url":
                     image_url = item.get("image_url", {})
-                    url = image_url.get("url", "") if isinstance(image_url, dict) else str(image_url)
+                    url = (
+                        image_url.get("url", "")
+                        if isinstance(image_url, dict)
+                        else str(image_url)
+                    )
                     # Responses API expects input_image with image_url field
-                    converted.append({
-                        "type": "input_image",
-                        "image_url": url
-                    })
+                    converted.append({"type": "input_image", "image_url": url})
 
                 # Convert file blocks to input_file
                 elif item_type == "file":
                     file_info = item.get("file", {})
-                    file_id = file_info.get("file_id", "") if isinstance(file_info, dict) else str(file_info)
-                    converted.append({
-                        "type": "input_file",
-                        "file_id": file_id
-                    })
+                    file_id = (
+                        file_info.get("file_id", "")
+                        if isinstance(file_info, dict)
+                        else str(file_info)
+                    )
+                    converted.append({"type": "input_file", "file_id": file_id})
 
                 # Keep other types as-is (shouldn't happen, but just in case)
                 else:
@@ -620,18 +617,9 @@ def get_answer_openai_native(
     reasoning_effort = st.session_state.get("reasoning_effort", "Low")
     openai_effort = get_openai_reasoning_effort(reasoning_effort)
 
-    # Prepare request parameters
-    request_params = {
-        "model": model_name,
-        "messages": openai_messages,
-    }
-
-    if model_name != OPENAI_MODELS["OpenAI-GPT-5.2"]:
-        request_params["temperature"] = 0.0
-
-    # GPT-5-mini requires Responses API (not Chat Completions) for reasoning
-    if model_name == OPENAI_MODELS["OpenAI-GPT-5-mini"]:
-        # GPT-5-mini always uses reasoning - use Responses API
+    # GPT-5.4-mini requires Responses API (not Chat Completions) for reasoning
+    if model_name == OPENAI_MODELS["OpenAI-GPT-5.4-mini"]:
+        # GPT-5.4-mini always uses reasoning - use Responses API
         effort_value = "low" if reasoning_effort == "None" else openai_effort
 
         # Convert messages to input format for Responses API
@@ -655,14 +643,17 @@ def get_answer_openai_native(
         if not responses_input:
             return "Error: No messages found"
 
-        # Use Responses API for GPT-5-mini
+        # Use Responses API for GPT-5.4-mini
         try:
-            response = client.responses.create(
-                model=model_name,
-                input=responses_input,
-                reasoning={"effort": effort_value},
-                max_output_tokens=4096,
-            )
+            responses_params = {
+                "model": model_name,
+                "input": responses_input,
+                "reasoning": {"effort": effort_value},
+                "max_output_tokens": 4096,
+            }
+            if enable_web_search:
+                responses_params["tools"] = [{"type": "web_search_preview"}]
+            response = client.responses.create(**responses_params)
 
             # Extract text from response - Responses API format
             # Structure: response.output[0] -> ResponseOutputMessage -> content[0] -> ResponseOutputText -> text
@@ -700,285 +691,86 @@ def get_answer_openai_native(
         except Exception as e:
             return f"Error calling Responses API: {str(e)}"
 
-    # GPT-5.2 requires Responses API when reasoning is enabled (similar to GPT-5-mini)
-    if model_name == OPENAI_MODELS["OpenAI-GPT-5.2"]:
-        if reasoning_effort != "None":
-            # GPT-5.2 with reasoning must use Responses API
-            effort_value = openai_effort
+    if model_name == OPENAI_MODELS["OpenAI-GPT-5.4"]:
+        # Always use Responses API for GPT-5.4
+        # When reasoning is "None", use minimum effort rather than disabling
+        effort_value = openai_effort if reasoning_effort != "None" else "low"
 
-            # Convert messages to input format for Responses API
-            # Responses API uses different content type names than Chat Completions
-            responses_input = []
-            for msg in openai_messages:
-                role = msg.get("role")
-                content = msg.get("content", "")
+        responses_input = []
+        for msg in openai_messages:
+            role = msg.get("role")
+            content = msg.get("content", "")
+            content = convert_chat_content_to_responses_format(content)
+            if role == "system":
+                continue
+            if role in ["user", "assistant"]:
+                responses_input.append({"role": role, "content": content})
 
-                # Convert content from Chat Completions format to Responses API format
-                content = convert_chat_content_to_responses_format(content)
+        if not responses_input:
+            return "Error: No messages found"
 
-                # Skip system messages (Responses API may not support them directly)
-                if role == "system":
-                    continue
+        try:
+            responses_params = {
+                "model": model_name,
+                "input": responses_input,
+                "reasoning": {"effort": effort_value},
+                "max_output_tokens": 4096,
+            }
+            if enable_web_search:
+                responses_params["tools"] = [{"type": "web_search_preview"}]
 
-                # Add user and assistant messages with converted content
-                if role in ["user", "assistant"]:
-                    responses_input.append({"role": role, "content": content})
+            response = client.responses.create(**responses_params)
 
-            if not responses_input:
-                return "Error: No messages found"
-
-            # Use Responses API for GPT-5.2 with reasoning
-            try:
-                response = client.responses.create(
-                    model=model_name,
-                    input=responses_input,
-                    reasoning={"effort": effort_value},
-                    max_output_tokens=4096,
-                )
-
-                # Extract text from response - Responses API format
-                # Handle different response structures to extract clean markdown text
-                text_parts = []
-
-                if hasattr(response, "output") and response.output:
-                    if isinstance(response.output, list):
-                        for output_item in response.output:
-                            # Skip reasoning items, only get message content
-                            if hasattr(output_item, "type"):
-                                if output_item.type == "message":
-                                    # Handle message content
-                                    if hasattr(output_item, "content"):
-                                        content = output_item.content
-                                        if isinstance(content, list):
-                                            for content_item in content:
-                                                # Extract text from ResponseOutputText objects
-                                                if hasattr(content_item, "type"):
-                                                    if (
-                                                        content_item.type
-                                                        == "output_text"
-                                                    ):
-                                                        if hasattr(
-                                                            content_item, "text"
-                                                        ):
-                                                            text_parts.append(
-                                                                content_item.text
-                                                            )
-                                                # Handle dict format
-                                                elif isinstance(content_item, dict):
-                                                    if (
-                                                        content_item.get("type")
-                                                        == "output_text"
-                                                        or "text" in content_item
-                                                    ):
-                                                        text_parts.append(
-                                                            content_item.get("text", "")
-                                                        )
-                                                # Handle string content
-                                                elif isinstance(content_item, str):
-                                                    text_parts.append(content_item)
-                                        # Handle direct text attribute
-                                        elif hasattr(content, "text"):
-                                            text_parts.append(content.text)
-                                        elif isinstance(content, str):
-                                            text_parts.append(content)
-                                # Fallback: check for text attribute directly
-                                elif hasattr(output_item, "text"):
-                                    text_parts.append(output_item.text)
-                            # Handle dict format
-                            elif isinstance(output_item, dict):
-                                if output_item.get("type") == "message":
-                                    content = output_item.get("content", [])
+            text_parts = []
+            if hasattr(response, "output") and response.output:
+                if isinstance(response.output, list):
+                    for output_item in response.output:
+                        if hasattr(output_item, "type"):
+                            if output_item.type == "message":
+                                if hasattr(output_item, "content"):
+                                    content = output_item.content
                                     if isinstance(content, list):
-                                        for item in content:
-                                            if (
-                                                isinstance(item, dict)
-                                                and "text" in item
-                                            ):
-                                                text_parts.append(item["text"])
+                                        for content_item in content:
+                                            if hasattr(content_item, "type"):
+                                                if content_item.type == "output_text":
+                                                    if hasattr(content_item, "text"):
+                                                        text_parts.append(content_item.text)
+                                            elif isinstance(content_item, dict):
+                                                if content_item.get("type") == "output_text" or "text" in content_item:
+                                                    text_parts.append(content_item.get("text", ""))
+                                            elif isinstance(content_item, str):
+                                                text_parts.append(content_item)
+                                    elif hasattr(content, "text"):
+                                        text_parts.append(content.text)
                                     elif isinstance(content, str):
                                         text_parts.append(content)
-                                elif "text" in output_item:
-                                    text_parts.append(output_item["text"])
+                            elif hasattr(output_item, "text"):
+                                text_parts.append(output_item.text)
+                        elif isinstance(output_item, dict):
+                            if output_item.get("type") == "message":
+                                content = output_item.get("content", [])
+                                if isinstance(content, list):
+                                    for item in content:
+                                        if isinstance(item, dict) and "text" in item:
+                                            text_parts.append(item["text"])
+                                elif isinstance(content, str):
+                                    text_parts.append(content)
+                            elif "text" in output_item:
+                                text_parts.append(output_item["text"])
 
-                # Join and return clean markdown text
-                if text_parts:
-                    result = "\n".join(text_parts).strip()
-                    return result if result else ""
+            if text_parts:
+                result = "\n".join(text_parts).strip()
+                return result if result else ""
 
-                # Final fallback - try to extract from string representation
-                response_str = str(response)
-                # Try to extract JSON-like structures if present
-                import re
+            response_str = str(response)
+            json_matches = re.findall(r'"text"\s*:\s*"([^"]*)"', response_str)
+            if json_matches:
+                return "\n".join(json_matches).strip()
+            return response_str
+        except Exception as e:
+            return f"Error calling Responses API: {str(e)}"
 
-                json_matches = re.findall(r'"text"\s*:\s*"([^"]*)"', response_str)
-                if json_matches:
-                    return "\n".join(json_matches).strip()
-
-                return response_str
-            except Exception as e:
-                return f"Error calling Responses API: {str(e)}"
-        # If reasoning is None, continue with Chat Completions API below
-
-    if enable_web_search:
-        request_params["tools"] = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "web_search",
-                    "description": "Search the web for current information, news, and up-to-date data. Use this when you need information beyond your knowledge cutoff date or for real-time information.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "The search query to look up on the web",
-                            }
-                        },
-                        "required": ["query"],
-                    },
-                },
-            }
-        ]
-
-    # Handle tool use loop - continue until we get final text response
-    max_iterations = 10  # Prevent infinite loops
-    iteration = 0
-
-    while iteration < max_iterations:
-        iteration += 1
-
-        # Make API call
-        response = client.chat.completions.create(**request_params)
-        message = response.choices[0].message
-
-        # If no tool calls, return the content
-        if not message.tool_calls:
-            # Handle different content formats and extract clean markdown text
-            content = message.content
-
-            # Handle list format: [{'type': 'text', 'text': '...', 'annotations': []}]
-            if isinstance(content, list):
-                text_parts = []
-                for block in content:
-                    if isinstance(block, dict):
-                        # Extract text from dict blocks - handle both 'text' and 'type' keys
-                        if "text" in block:
-                            text_value = block["text"]
-                            if text_value:  # Only add non-empty text
-                                text_parts.append(str(text_value))
-                        # Also check for nested structures
-                        elif "content" in block:
-                            nested_content = block["content"]
-                            if isinstance(nested_content, str):
-                                text_parts.append(nested_content)
-                            elif isinstance(nested_content, list):
-                                for item in nested_content:
-                                    if isinstance(item, dict) and "text" in item:
-                                        text_parts.append(str(item["text"]))
-                                    elif isinstance(item, str):
-                                        text_parts.append(item)
-                    elif isinstance(block, str):
-                        text_parts.append(block)
-                    # Handle object attributes
-                    elif hasattr(block, "text"):
-                        text_parts.append(str(block.text))
-
-                # Return joined text or empty string
-                result = "\n".join(text_parts).strip() if text_parts else ""
-                # If we got text, return it; otherwise try to extract from string representation
-                if result:
-                    return result
-                # Last resort: try to extract from string representation
-                content_str = str(content)
-                if content_str.startswith("[{") and '"text"' in content_str:
-                    # Try regex extraction as fallback
-                    json_matches = re.findall(r'"text"\s*:\s*"([^"]*)"', content_str)
-                    if json_matches:
-                        return "\n".join(json_matches).strip()
-                return content_str
-            elif isinstance(content, str):
-                return content.strip()
-            else:
-                # Try to extract text from object attributes
-                if hasattr(content, "text"):
-                    return str(content.text).strip()
-                # If content is a dict-like object, try to get text
-                if isinstance(content, dict) and "text" in content:
-                    return str(content["text"]).strip()
-                return str(content).strip() if content else ""
-
-        # Process tool calls
-        openai_messages.append(message)
-
-        for tool_call in message.tool_calls:
-            if tool_call.function.name == "web_search":
-                args = json.loads(tool_call.function.arguments)
-                search_results = web_search(args.get("query", ""))
-                openai_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": search_results,
-                    }
-                )
-
-        # Update request_params with new messages for next iteration
-        request_params["messages"] = openai_messages
-
-    # If we hit max iterations, return last message content
-    if message.content:
-        # Handle different content formats and extract clean markdown text
-        content = message.content
-        if isinstance(content, list):
-            # Extract text from content blocks: [{'type': 'text', 'text': '...', 'annotations': []}]
-            text_parts = []
-            for block in content:
-                if isinstance(block, dict):
-                    # Extract text from dict blocks - handle 'text' key
-                    if "text" in block:
-                        text_value = block["text"]
-                        if text_value:  # Only add non-empty text
-                            text_parts.append(str(text_value))
-                    # Also check for nested structures
-                    elif "content" in block:
-                        nested_content = block["content"]
-                        if isinstance(nested_content, str):
-                            text_parts.append(nested_content)
-                        elif isinstance(nested_content, list):
-                            for item in nested_content:
-                                if isinstance(item, dict) and "text" in item:
-                                    text_parts.append(str(item["text"]))
-                                elif isinstance(item, str):
-                                    text_parts.append(item)
-                elif isinstance(block, str):
-                    text_parts.append(block)
-                # Handle object attributes
-                elif hasattr(block, "text"):
-                    text_parts.append(str(block.text))
-
-            # Return joined text or try regex extraction
-            result = "\n".join(text_parts).strip() if text_parts else ""
-            if result:
-                return result
-            # Fallback: try regex extraction from string representation
-            content_str = str(content)
-            if '"text"' in content_str:
-                json_matches = re.findall(r'"text"\s*:\s*"([^"]*)"', content_str)
-                if json_matches:
-                    return "\n".join(json_matches).strip()
-            return content_str
-        elif isinstance(content, str):
-            return content.strip()
-        else:
-            # Try to extract text from object attributes
-            if hasattr(content, "text"):
-                return str(content.text).strip()
-            # If content is a dict-like object, try to get text
-            if isinstance(content, dict) and "text" in content:
-                return str(content["text"]).strip()
-            return str(content).strip() if content else ""
-    else:
-        return "Unable to complete response after multiple tool calls."
+    return "Unsupported OpenAI model"
 
 
 def get_answer(llm, messages):
@@ -994,16 +786,16 @@ def get_answer(llm, messages):
     # Show status message if files are attached
     if file_ids or pdf_contents or image_contents:
         file_count = (
-            len(file_ids or [])
-            + len(pdf_contents or [])
-            + len(image_contents or [])
+            len(file_ids or []) + len(pdf_contents or []) + len(image_contents or [])
         )
-        st.info(f"📎 Sending {file_count} attached file(s) to {selected_model} for analysis...")
+        st.info(
+            f"📎 Sending {file_count} attached file(s) to {selected_model} for analysis..."
+        )
 
-    # GPT-5-mini and GPT-5.2 with reasoning always use native API (Responses API) since LangChain doesn't support it
+    # GPT-5.4-mini and GPT-5.4 with reasoning always use native API (Responses API) since LangChain doesn't support it
     reasoning_effort = st.session_state.get("reasoning_effort", "Low")
 
-    if selected_model == "OpenAI-GPT-5-mini":
+    if selected_model == "OpenAI-GPT-5.4-mini":
         model_name = OPENAI_MODELS.get(selected_model)
         if model_name:
             return get_answer_openai_native(
@@ -1015,8 +807,8 @@ def get_answer(llm, messages):
                 image_mime_types,
             )
 
-    # GPT-5.2 with reasoning must use native API (Responses API)
-    if selected_model == "OpenAI-GPT-5.2" and reasoning_effort != "None":
+    # GPT-5.4 with reasoning must use native API (Responses API)
+    if selected_model == "OpenAI-GPT-5.4" and reasoning_effort != "None":
         model_name = OPENAI_MODELS.get(selected_model)
         if model_name:
             return get_answer_openai_native(
