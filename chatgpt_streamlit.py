@@ -4,7 +4,7 @@ import base64
 import tempfile
 import time
 import os
-import re
+from typing import Optional
 
 from langchain_community.callbacks import get_openai_callback
 from langchain_openai import ChatOpenAI
@@ -15,7 +15,6 @@ from langchain.schema import SystemMessage, HumanMessage, AIMessage
 import streamlit as st
 from anthropic import Anthropic
 from openai import OpenAI
-from tavily import TavilyClient
 
 # Model name mappings
 ANTHROPIC_MODELS = {
@@ -79,14 +78,14 @@ def get_file_type(file_name: str) -> str:
     return "unknown"
 
 
-def is_openai_model(model_str: str = None, selected_model: str = None) -> bool:
+def is_openai_model(model_str: str = "", selected_model: str = "") -> bool:
     """Check if model is OpenAI-based"""
     if selected_model:
         return selected_model.startswith("OpenAI")
     return "ChatOpenAI" in (model_str or "")
 
 
-def is_anthropic_model(model_str: str = None, selected_model: str = None) -> bool:
+def is_anthropic_model(model_str: str = "", selected_model: str = "") -> bool:
     """Check if model is Anthropic-based"""
     if selected_model:
         return selected_model.startswith("Claude")
@@ -98,38 +97,6 @@ def get_image_mime_type(filename: str) -> str:
     ext = filename.lower().split(".")[-1]
     return f"image/{ext}" if ext != "jpg" else "image/jpeg"
 
-
-def web_search(query: str) -> str:
-    """Perform web search using Tavily API
-
-    Args:
-        query: The search query string
-
-    Returns:
-        Formatted string with search results including titles, content, and URLs
-    """
-    try:
-        tavily_api_key = os.getenv("TAVILY_API_KEY")
-        if not tavily_api_key:
-            return "Error: TAVILY_API_KEY not found in environment variables. Please add it to your .chat-env file."
-
-        client = TavilyClient(api_key=tavily_api_key)
-        response = client.search(query, max_results=5)
-
-        if not response.get("results"):
-            return f"No search results found for query: {query}"
-
-        # Format results
-        results = []
-        for i, result in enumerate(response["results"], 1):
-            title = result.get("title", "No title")
-            content = result.get("content", "No content available")
-            url = result.get("url", "")
-            results.append(f"{i}. **{title}**\n{content}\nSource: {url}")
-
-        return "\n\n".join(results)
-    except Exception as e:
-        return f"Web search error: {str(e)}"
 
 
 def upload_file_to_anthropic(file_content: bytes, file_name: str) -> str:
@@ -148,7 +115,7 @@ def upload_file_to_anthropic(file_content: bytes, file_name: str) -> str:
         return response.id
     except Exception as e:
         st.error(f"Error uploading file to Anthropic: {str(e)}")
-        return None
+        return ""
 
 
 def upload_file_to_openai(file_content: bytes, file_name: str) -> str:
@@ -183,7 +150,7 @@ def upload_file_to_openai(file_content: bytes, file_name: str) -> str:
                     return file_id
                 elif file_status.status == "error":
                     st.error(f"File processing failed: {file_status.error}")
-                    return None
+                    return ""
                 time.sleep(1)
                 wait_time += 1
 
@@ -199,7 +166,7 @@ def upload_file_to_openai(file_content: bytes, file_name: str) -> str:
 
     except Exception as e:
         st.error(f"Error uploading file to OpenAI: {str(e)}")
-        return None
+        return ""
 
 
 def init_messages():
@@ -257,7 +224,7 @@ def select_model():
         if ai_model.startswith("Claude"):
             st.sidebar.info("✅ Native web search enabled for Claude")
         elif ai_model.startswith("OpenAI"):
-            st.sidebar.info("✅ Web search enabled via Tavily API")
+            st.sidebar.info("✅ Web search enabled (OpenAI native)")
 
     # Get reasoning effort from session state
     reasoning_effort = st.session_state.get("reasoning_effort", "Low")
@@ -714,7 +681,7 @@ def get_answer_openai_native(
                 "model": model_name,
                 "input": responses_input,
                 "reasoning": {"effort": effort_value},
-                "max_output_tokens": 4096,
+                "max_output_tokens": 16384,
             }
             if enable_web_search:
                 responses_params["tools"] = [{"type": "web_search_preview"}]
@@ -734,10 +701,18 @@ def get_answer_openai_native(
                                             if hasattr(content_item, "type"):
                                                 if content_item.type == "output_text":
                                                     if hasattr(content_item, "text"):
-                                                        text_parts.append(content_item.text)
+                                                        text_parts.append(
+                                                            content_item.text
+                                                        )
                                             elif isinstance(content_item, dict):
-                                                if content_item.get("type") == "output_text" or "text" in content_item:
-                                                    text_parts.append(content_item.get("text", ""))
+                                                if (
+                                                    content_item.get("type")
+                                                    == "output_text"
+                                                    or "text" in content_item
+                                                ):
+                                                    text_parts.append(
+                                                        content_item.get("text", "")
+                                                    )
                                             elif isinstance(content_item, str):
                                                 text_parts.append(content_item)
                                     elif hasattr(content, "text"):
@@ -762,11 +737,23 @@ def get_answer_openai_native(
                 result = "\n".join(text_parts).strip()
                 return result if result else ""
 
-            response_str = str(response)
-            json_matches = re.findall(r'"text"\s*:\s*"([^"]*)"', response_str)
-            if json_matches:
-                return "\n".join(json_matches).strip()
-            return response_str
+            incomplete = getattr(response, "incomplete_details", None)
+            if incomplete is not None:
+                reason = getattr(incomplete, "reason", None) or (
+                    incomplete.get("reason")
+                    if isinstance(incomplete, dict)
+                    else "unknown"
+                )
+                if reason == "max_output_tokens":
+                    return (
+                        "⚠️ Response truncated before any text was produced — reasoning "
+                        "and web search consumed the entire `max_output_tokens` budget. "
+                        "Try lowering the Reasoning Effort, disabling Web Search, or "
+                        "narrowing the question."
+                    )
+                return f"⚠️ Response incomplete: {reason}"
+
+            return "⚠️ Model returned no text output."
         except Exception as e:
             return f"Error calling Responses API: {str(e)}"
 
