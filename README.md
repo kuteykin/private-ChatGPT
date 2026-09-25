@@ -77,8 +77,8 @@ Models are defined in dictionary mappings at the top of the file:
 
 ```python
 ANTHROPIC_MODELS = {
-    "Claude-4.6-Opus": "claude-opus-4-6",
-    "Claude-4.6-Sonnet": "claude-sonnet-4-6",
+    "Claude-Opus-5.5": "claude-opus-5-5",
+    "Claude-Sonnet-5": "claude-sonnet-5",
 }
 
 OPENAI_MODELS = {

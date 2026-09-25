@@ -7,52 +7,140 @@ import os
 from typing import Optional
 
 from langchain_community.callbacks import get_openai_callback
-from langchain_openai import ChatOpenAI
-from langchain_anthropic import ChatAnthropic
-from langchain_community.llms import Replicate
 from langchain.globals import set_verbose
 from langchain.schema import SystemMessage, HumanMessage, AIMessage
+import replicate
 import streamlit as st
 from anthropic import Anthropic
 from openai import OpenAI
 
 # Model name mappings
 ANTHROPIC_MODELS = {
-    "Claude-4.6-Opus": "claude-opus-4-6",
-    "Claude-4.6-Sonnet": "claude-sonnet-4-6",
+    "Claude-Opus-5.5": "claude-opus-5-5",
+    "Claude-Sonnet-5": "claude-sonnet-5",
 }
 
-OPENAI_MODELS = {
-    "OpenAI-GPT-5.4": "gpt-5.4",
-    "OpenAI-GPT-5.4-mini": "gpt-5.4-mini",
+ANTHROPIC_MODEL_ALIASES = {
+    "Claude Opus-5.5": "claude-opus-5-5",
+    "Claude Sonnet-5": "claude-sonnet-5",
 }
+
+
+def get_anthropic_api_model(selected_model: str) -> Optional[str]:
+    if selected_model in ANTHROPIC_MODELS:
+        return ANTHROPIC_MODELS[selected_model]
+    if selected_model in ANTHROPIC_MODEL_ALIASES:
+        return ANTHROPIC_MODEL_ALIASES[selected_model]
+    return None
+
+OPENAI_MODELS = {
+    "OpenAI GPT-6 Sol": "gpt-6-sol",
+    "OpenAI GPT-6 Luna": "gpt-6-luna",
+    "OpenAI-GPT-5.6 Terra": "gpt-5.6-terra",
+    "EXPENSIVE OpenAI GPT-6 Astra": "gpt-6-astra",
+}
+
+DEEPSEEK_MODEL_LABEL = "DeepSeek-V3.1"
+DEEPSEEK_REPLICATE_MODEL = "deepseek-ai/deepseek-v3.1"
 
 # File type mappings
 IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "gif", "webp"}
 TEXT_EXTENSIONS = {"txt", "md", "csv"}
 
+REASONING_EFFORT_OPTIONS = ("none", "low", "medium", "high")
+
+
+def normalize_reasoning_effort(user_effort: str) -> str:
+    """Accept current and legacy sidebar values."""
+    legacy = {"None": "none", "Low": "low", "Medium": "medium", "High": "high"}
+    if user_effort in legacy:
+        return legacy[user_effort]
+    if user_effort in REASONING_EFFORT_OPTIONS:
+        return user_effort
+    return "low"
+
 
 def get_openai_reasoning_effort(user_effort: str) -> str:
-    """Map user-selected reasoning effort to OpenAI API value"""
-    mapping = {
-        "None": "none",
-        "Low": "low",
-        "Medium": "medium",
-        "High": "high",
-    }
-    return mapping.get(user_effort, "medium")
+    """Map sidebar selection to OpenAI Responses API reasoning.effort."""
+    if user_effort in REASONING_EFFORT_OPTIONS:
+        return user_effort
+    return "medium"
 
 
 def get_anthropic_reasoning_effort(user_effort: str) -> str:
-    """Map user-selected reasoning effort to Anthropic API value"""
-    # Anthropic: None->low, Low->medium, Medium->high, High->high
-    mapping = {
-        "None": "low",
-        "Low": "medium",
-        "Medium": "high",
-        "High": "high",
-    }
-    return mapping.get(user_effort, "medium")
+    """Map sidebar selection to Anthropic output_config.effort (no API 'none')."""
+    if user_effort == "none":
+        return "low"
+    if user_effort in ("low", "medium", "high"):
+        return user_effort
+    return "medium"
+
+
+def apply_anthropic_output_effort(request_params: dict, effort: str) -> None:
+    """Attach Anthropic effort via output_config on the HTTP request."""
+    extra_body = dict(request_params.get("extra_body") or {})
+    extra_body["output_config"] = {"effort": effort}
+    request_params["extra_body"] = extra_body
+
+
+def create_anthropic_message(client, request_params: dict):
+    """Create a message, falling back if output_config.effort is rejected."""
+    try:
+        return client.messages.create(**request_params)
+    except Exception as exc:
+        if "output_config" not in str(exc) and "effort" not in str(exc):
+            raise
+        fallback = request_params.copy()
+        extra_body = dict(fallback.pop("extra_body", None) or {})
+        extra_body.pop("output_config", None)
+        if extra_body:
+            fallback["extra_body"] = extra_body
+        return client.messages.create(**fallback)
+
+
+def is_deepseek_model(selected_model: str = "") -> bool:
+    return selected_model == DEEPSEEK_MODEL_LABEL
+
+
+def format_deepseek_pdf_attachments(pdf_contents, pdf_filenames) -> str:
+    """Embed PDF bytes for DeepSeek native document parsing in the prompt."""
+    blocks = []
+    for pdf_b64, filename in zip(pdf_contents, pdf_filenames):
+        blocks.append(f'<pdf filename="{filename}">\n' f"data:application/pdf;base64,{pdf_b64}\n" f"</pdf>")
+    return "\n\n".join(blocks)
+
+
+def messages_to_deepseek_prompt(messages, pdf_contents=None, pdf_filenames=None) -> str:
+    """Flatten LangChain messages into a single prompt for Replicate."""
+    parts = []
+    last_index = len(messages) - 1
+    for i, msg in enumerate(messages):
+        if isinstance(msg, SystemMessage):
+            parts.append(f"System:\n{msg.content}")
+        elif isinstance(msg, HumanMessage):
+            content = msg.content
+            if pdf_contents and pdf_filenames and i == last_index and isinstance(msg, HumanMessage):
+                content = format_deepseek_pdf_attachments(pdf_contents, pdf_filenames) + "\n\n" + content
+            parts.append(f"User:\n{content}")
+        elif isinstance(msg, AIMessage):
+            parts.append(f"Assistant:\n{msg.content}")
+    parts.append("Assistant:")
+    return "\n\n".join(parts)
+
+
+def collect_replicate_output(output) -> str:
+    if isinstance(output, str):
+        return output.strip()
+    if hasattr(output, "__iter__") and not isinstance(output, (str, bytes, dict)):
+        return "".join(str(chunk) for chunk in output).strip()
+    return str(output).strip()
+
+
+def get_deepseek_thinking(user_effort: str) -> Optional[str]:
+    """Map sidebar selection to Replicate DeepSeek `thinking` (separate from OpenAI/Anthropic)."""
+    if user_effort in ("none", "low"):
+        return None
+    return "medium"
 
 
 def init_page():
@@ -81,15 +169,15 @@ def get_file_type(file_name: str) -> str:
 def is_openai_model(model_str: str = "", selected_model: str = "") -> bool:
     """Check if model is OpenAI-based"""
     if selected_model:
-        return selected_model.startswith("OpenAI")
-    return "ChatOpenAI" in (model_str or "")
+        return selected_model in OPENAI_MODELS
+    return False
 
 
 def is_anthropic_model(model_str: str = "", selected_model: str = "") -> bool:
     """Check if model is Anthropic-based"""
     if selected_model:
-        return selected_model.startswith("Claude")
-    return "ChatAnthropic" in (model_str or "")
+        return get_anthropic_api_model(selected_model) is not None
+    return False
 
 
 def get_image_mime_type(filename: str) -> str:
@@ -98,11 +186,25 @@ def get_image_mime_type(filename: str) -> str:
     return f"image/{ext}" if ext != "jpg" else "image/jpeg"
 
 
+def get_anthropic_workspace_id() -> Optional[str]:
+    """Workspace ID for multi-workspace API keys (anthropic-workspace-id header)."""
+    workspace = (os.getenv("ANTHROPIC_WORKSPACE") or "").strip()
+    return workspace or None
+
+
+def create_anthropic_client() -> Anthropic:
+    """Anthropic client with optional workspace header from ANTHROPIC_WORKSPACE."""
+    kwargs = {"api_key": os.getenv("ANTHROPIC_API_KEY")}
+    workspace_id = get_anthropic_workspace_id()
+    if workspace_id:
+        kwargs["default_headers"] = {"anthropic-workspace-id": workspace_id}
+    return Anthropic(**kwargs)
+
 
 def upload_file_to_anthropic(file_content: bytes, file_name: str) -> str:
     """Upload file to Anthropic's Files API and return file_id"""
     try:
-        client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        client = create_anthropic_client()
 
         # Determine file purpose based on type
         file_type = get_file_type(file_name)
@@ -128,9 +230,7 @@ def upload_file_to_openai(file_content: bytes, file_name: str) -> str:
         client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
         # Create a temporary file to upload
-        with tempfile.NamedTemporaryFile(
-            delete=False, suffix=os.path.splitext(file_name)[1]
-        ) as tmp_file:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file_name)[1]) as tmp_file:
             tmp_file.write(file_content)
             tmp_file_path = tmp_file.name
 
@@ -155,9 +255,7 @@ def upload_file_to_openai(file_content: bytes, file_name: str) -> str:
                 wait_time += 1
 
             # If we get here, file processing timed out
-            st.warning(
-                f"File processing is taking longer than expected. File ID: {file_id}"
-            )
+            st.warning(f"File processing is taking longer than expected. File ID: {file_id}")
             return file_id  # Return anyway, might still work
 
         finally:
@@ -173,9 +271,7 @@ def init_messages():
     clear_button = st.sidebar.button("Clear Conversation", key="clear")
     if clear_button or "messages" not in st.session_state:
         st.session_state.messages = [
-            SystemMessage(
-                content="You are a helpful AI assistant. Respond your answer in markdown format."
-            )
+            SystemMessage(content="You are a helpful AI assistant. Respond your answer in markdown format.")
         ]
         # Clear file attachments when conversation is cleared
         st.session_state.last_file_ids = []
@@ -191,11 +287,13 @@ def select_model():
     ai_model = st.sidebar.radio(
         "Choose LLM:",
         (
-            "OpenAI-GPT-5.4",
-            "OpenAI-GPT-5.4-mini",
-            "Claude-4.6-Opus",
-            "Claude-4.6-Sonnet",
-            "DeepSeek-R1",
+            "OpenAI GPT-6 Sol",
+            "OpenAI GPT-6 Luna",
+            "OpenAI-GPT-5.6 Terra",
+            "EXPENSIVE OpenAI GPT-6 Astra",
+            "Claude-Opus-5.5",
+            "Claude-Sonnet-5",
+            DEEPSEEK_MODEL_LABEL,
         ),
     )
 
@@ -213,66 +311,39 @@ def select_model():
     # Reasoning effort selection
     reasoning_effort = st.sidebar.radio(
         "Reasoning Effort:",
-        ("None", "Low", "Medium", "High"),
-        index=1,  # Default to "Low"
-        help="Control the depth of reasoning. Higher effort = better quality but slower responses and more tokens.",
+        REASONING_EFFORT_OPTIONS,
+        index=1,
+        format_func=str.capitalize,
+        help=(
+            "OpenAI: sent as reasoning.effort (none, low, medium, high). "
+            "Anthropic: sent as output_config.effort; 'none' maps to low. "
+            "DeepSeek on Replicate: medium/high enable thinking mode."
+        ),
     )
-    st.session_state.reasoning_effort = reasoning_effort
+    st.session_state.reasoning_effort = normalize_reasoning_effort(reasoning_effort)
 
     # Show info about web search availability
     if enable_web_search:
         if ai_model.startswith("Claude"):
             st.sidebar.info("✅ Native web search enabled for Claude")
-        elif ai_model.startswith("OpenAI"):
-            st.sidebar.info("✅ Web search enabled (OpenAI native)")
+        elif ai_model in OPENAI_MODELS:
+            st.sidebar.info("✅ Web search enabled (OpenAI Responses API)")
+        elif is_deepseek_model(ai_model):
+            st.sidebar.warning("Web search is not available for DeepSeek on Replicate.")
 
-    # Get reasoning effort from session state
-    reasoning_effort = st.session_state.get("reasoning_effort", "Low")
+    if is_deepseek_model(ai_model):
+        st.sidebar.caption(
+            "DeepSeek-V3.1 accepts PDF attachments natively (raw PDF in the prompt). "
+            "Text/Markdown/CSV are inlined. Images display in the UI only."
+        )
 
     if ai_model in OPENAI_MODELS:
-        model_name = OPENAI_MODELS[ai_model]
-        openai_effort = get_openai_reasoning_effort(reasoning_effort)
+        # OpenAI uses native Responses API only (see get_answer_openai_native)
+        return None
 
-        if ai_model == "OpenAI-GPT-5.4":
-            # GPT-5.4 without reasoning can use LangChain wrapper
-            # With reasoning, it will use native API (handled in get_answer function)
-            return ChatOpenAI(model_name=model_name)
-        elif ai_model == "OpenAI-GPT-5.4-mini":
-            # GPT-5.4-mini always uses native API (Responses API) - this won't be used
-            # But we need to return something for LangChain compatibility
-            return ChatOpenAI(model_name=model_name)
-
-    elif ai_model.startswith("Claude"):
-        model_name = ANTHROPIC_MODELS.get(ai_model)
-        # Note: Effort parameter is only supported via native API (beta feature)
-        # LangChain wrapper doesn't support beta effort parameter, so we skip it here
-        # Effort will be applied when using native API (for file uploads/web search)
-        return ChatAnthropic(
-            temperature=0.0,
-            max_tokens=4096,
-            model=model_name,
-        )
-    elif ai_model == "DeepSeek-R1":
-        # Get reasoning effort from session state
-        reasoning_effort = st.session_state.get("reasoning_effort", "Low")
-        # Map reasoning effort to Replicate format (if supported)
-        # DeepSeek-R1 may support reasoning_effort parameter
-        replicate_kwargs = {
-            "temperature": 0.0,
-            "max_new_tokens": 8192,
-            "top_p": 0.9,
-        }
-        # Add reasoning effort if model supports it
-        # Note: Check Replicate documentation for exact parameter name
-        if reasoning_effort != "None":
-            # Try reasoning_effort parameter (common for reasoning models on Replicate)
-            replicate_kwargs["reasoning_effort"] = reasoning_effort.lower()
-
-        return Replicate(
-            streaming=True,
-            model_kwargs=replicate_kwargs,
-            model="deepseek-ai/deepseek-r1",
-        )
+    if ai_model.startswith("Claude") or is_deepseek_model(ai_model):
+        # Native SDK paths only (see get_answer_*_native)
+        return None
 
 
 def convert_messages_to_anthropic(
@@ -310,9 +381,7 @@ def convert_messages_to_anthropic(
 
             # Attach images if provided and this is the last message
             if image_contents and image_mime_types and is_last_message:
-                for image_content, image_mime_type in zip(
-                    image_contents, image_mime_types
-                ):
+                for image_content, image_mime_type in zip(image_contents, image_mime_types):
                     message_content.append(
                         {
                             "type": "image",
@@ -346,20 +415,19 @@ def get_answer_anthropic_native(
     image_mime_types=None,
 ):
     """Get answer from Anthropic using native SDK with web search, multiple PDFs and images support"""
-    client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    client = create_anthropic_client()
     anthropic_messages, system_content = convert_messages_to_anthropic(
         messages, pdf_contents, pdf_filenames, image_contents, image_mime_types
     )
 
     # Get reasoning effort from session state
-    reasoning_effort = st.session_state.get("reasoning_effort", "Low")
+    reasoning_effort = normalize_reasoning_effort(st.session_state.get("reasoning_effort", "low"))
     anthropic_effort = get_anthropic_reasoning_effort(reasoning_effort)
 
     # Prepare request parameters
     request_params = {
         "model": model_name,
         "max_tokens": 4096,
-        "temperature": 0.0,
         "messages": anthropic_messages,
     }
 
@@ -367,28 +435,9 @@ def get_answer_anthropic_native(
         request_params["system"] = system_content
 
     if enable_web_search:
-        request_params["tools"] = [
-            {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}
-        ]
+        request_params["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}]
 
-    # Add effort parameter using beta API
-    # Effort is a beta feature - try to use it, but fall back if not supported
-    use_beta_api = False
-    if (
-        anthropic_effort and anthropic_effort != "low"
-    ):  # Only use beta API for medium/high effort
-        try:
-            # Try beta API with effort parameter
-            request_params["betas"] = ["effort-2025-11-24"]
-            request_params["effort"] = anthropic_effort
-            use_beta_api = True
-        except Exception:
-            # If beta API setup fails, fall back to regular API
-            use_beta_api = False
-            if "betas" in request_params:
-                del request_params["betas"]
-            if "effort" in request_params:
-                del request_params["effort"]
+    apply_anthropic_output_effort(request_params, anthropic_effort)
 
     # Handle tool use loop - continue until we get final text response
     max_iterations = 10  # Prevent infinite loops
@@ -397,27 +446,7 @@ def get_answer_anthropic_native(
     while iteration < max_iterations:
         iteration += 1
 
-        # Make API call - use beta API if effort is specified and supported
-        try:
-            if use_beta_api:
-                response = client.beta.messages.create(**request_params)
-            else:
-                response = client.messages.create(**request_params)
-        except TypeError as e:
-            # If beta API doesn't support effort parameter, fall back to regular API
-            if "effort" in str(e) or "output_config" in str(e):
-                if use_beta_api:
-                    # Remove effort-related parameters and retry with regular API
-                    request_params_fallback = request_params.copy()
-                    request_params_fallback.pop("betas", None)
-                    request_params_fallback.pop("effort", None)
-                    request_params_fallback.pop("output_config", None)
-                    response = client.messages.create(**request_params_fallback)
-                    use_beta_api = False  # Don't try beta API again
-                else:
-                    raise
-            else:
-                raise
+        response = create_anthropic_message(client, request_params)
 
         # First, extract only text content blocks (filter out all tool use and metadata)
         text_parts = []
@@ -446,16 +475,10 @@ def get_answer_anthropic_native(
         # If response stopped due to tool use, continue the conversation
         if response.stop_reason == "tool_use":
             # Add assistant message with tool use to continue conversation
-            anthropic_messages.append(
-                {"role": "assistant", "content": response.content}
-            )
+            anthropic_messages.append({"role": "assistant", "content": response.content})
 
             # Update request_params to use updated messages for next iteration
             request_params["messages"] = anthropic_messages
-            # Ensure beta API and effort config are maintained for subsequent calls
-            if use_beta_api and "betas" not in request_params:
-                request_params["betas"] = ["effort-2025-11-24"]
-                request_params["effort"] = anthropic_effort
             continue
 
         # If we get here, no text content and not tool use - break
@@ -465,9 +488,7 @@ def get_answer_anthropic_native(
     return ""
 
 
-def convert_messages_to_openai(
-    messages, file_ids=None, image_contents=None, image_mime_types=None
-):
+def convert_messages_to_openai(messages, file_ids=None, image_contents=None, image_mime_types=None):
     """Convert LangChain messages to OpenAI format with multiple file support"""
     openai_messages = []
 
@@ -481,24 +502,18 @@ def convert_messages_to_openai(
 
             # Attach images if provided and this is the last message
             if image_contents and image_mime_types and is_last_message:
-                for image_content, image_mime_type in zip(
-                    image_contents, image_mime_types
-                ):
+                for image_content, image_mime_type in zip(image_contents, image_mime_types):
                     message_content.append(
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{image_mime_type};base64,{image_content}"
-                            },
+                            "image_url": {"url": f"data:{image_mime_type};base64,{image_content}"},
                         }
                     )
 
             # Attach files if provided and this is the last message
             if file_ids and is_last_message:
                 for file_id in file_ids:
-                    message_content.append(
-                        {"type": "file", "file": {"file_id": file_id}}
-                    )
+                    message_content.append({"type": "file", "file": {"file_id": file_id}})
 
             # Add text content
             if message_content:
@@ -530,29 +545,19 @@ def convert_chat_content_to_responses_format(content):
 
                 # Convert text blocks
                 if item_type == "text":
-                    converted.append(
-                        {"type": "input_text", "text": item.get("text", "")}
-                    )
+                    converted.append({"type": "input_text", "text": item.get("text", "")})
 
                 # Convert image_url blocks to input_image
                 elif item_type == "image_url":
                     image_url = item.get("image_url", {})
-                    url = (
-                        image_url.get("url", "")
-                        if isinstance(image_url, dict)
-                        else str(image_url)
-                    )
+                    url = image_url.get("url", "") if isinstance(image_url, dict) else str(image_url)
                     # Responses API expects input_image with image_url field
                     converted.append({"type": "input_image", "image_url": url})
 
                 # Convert file blocks to input_file
                 elif item_type == "file":
                     file_info = item.get("file", {})
-                    file_id = (
-                        file_info.get("file_id", "")
-                        if isinstance(file_info, dict)
-                        else str(file_info)
-                    )
+                    file_id = file_info.get("file_id", "") if isinstance(file_info, dict) else str(file_info)
                     converted.append({"type": "input_file", "file_id": file_id})
 
                 # Keep other types as-is (shouldn't happen, but just in case)
@@ -566,6 +571,64 @@ def convert_chat_content_to_responses_format(content):
     return content
 
 
+def extract_openai_responses_text(response) -> list[str]:
+    """Extract assistant text from an OpenAI Responses API response."""
+    text_parts: list[str] = []
+    if not hasattr(response, "output") or not response.output:
+        return text_parts
+
+    if not isinstance(response.output, list):
+        return text_parts
+
+    for output_item in response.output:
+        if hasattr(output_item, "type"):
+            if output_item.type == "message" and hasattr(output_item, "content"):
+                content = output_item.content
+                if isinstance(content, list):
+                    for content_item in content:
+                        if hasattr(content_item, "type") and content_item.type == "output_text":
+                            if hasattr(content_item, "text"):
+                                text_parts.append(content_item.text)
+                        elif isinstance(content_item, dict) and (
+                            content_item.get("type") == "output_text" or "text" in content_item
+                        ):
+                            text_parts.append(content_item.get("text", ""))
+                        elif isinstance(content_item, str):
+                            text_parts.append(content_item)
+                elif hasattr(content, "text"):
+                    text_parts.append(content.text)
+                elif isinstance(content, str):
+                    text_parts.append(content)
+            elif hasattr(output_item, "text"):
+                text_parts.append(output_item.text)
+        elif isinstance(output_item, dict):
+            if output_item.get("type") == "message":
+                content = output_item.get("content", [])
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and "text" in item:
+                            text_parts.append(item["text"])
+                elif isinstance(content, str):
+                    text_parts.append(content)
+            elif "text" in output_item:
+                text_parts.append(output_item["text"])
+
+    return text_parts
+
+
+def build_openai_responses_input(openai_messages):
+    """Build Responses API input from Chat Completions-style messages."""
+    responses_input = []
+    for msg in openai_messages:
+        role = msg.get("role")
+        content = convert_chat_content_to_responses_format(msg.get("content", ""))
+        if role == "system":
+            continue
+        if role in ("user", "assistant"):
+            responses_input.append({"role": role, "content": content})
+    return responses_input
+
+
 def get_answer_openai_native(
     messages,
     model_name,
@@ -576,188 +639,75 @@ def get_answer_openai_native(
 ):
     """Get answer from OpenAI using native SDK with multiple PDF files, images support, and web search"""
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    openai_messages = convert_messages_to_openai(
-        messages, file_ids, image_contents, image_mime_types
-    )
+    openai_messages = convert_messages_to_openai(messages, file_ids, image_contents, image_mime_types)
 
-    # Get reasoning effort from session state
-    reasoning_effort = st.session_state.get("reasoning_effort", "Low")
-    openai_effort = get_openai_reasoning_effort(reasoning_effort)
+    if model_name not in OPENAI_MODELS.values():
+        return "Unsupported OpenAI model"
 
-    # GPT-5.4-mini requires Responses API (not Chat Completions) for reasoning
-    if model_name == OPENAI_MODELS["OpenAI-GPT-5.4-mini"]:
-        # GPT-5.4-mini always uses reasoning - use Responses API
-        effort_value = "low" if reasoning_effort == "None" else openai_effort
+    reasoning_effort = normalize_reasoning_effort(st.session_state.get("reasoning_effort", "low"))
+    effort_value = get_openai_reasoning_effort(reasoning_effort)
 
-        # Convert messages to input format for Responses API
-        # Responses API uses different content type names than Chat Completions
-        responses_input = []
-        for msg in openai_messages:
-            role = msg.get("role")
-            content = msg.get("content", "")
+    responses_input = build_openai_responses_input(openai_messages)
+    if not responses_input:
+        return "Error: No messages found"
 
-            # Convert content from Chat Completions format to Responses API format
-            content = convert_chat_content_to_responses_format(content)
+    try:
+        responses_params = {
+            "model": model_name,
+            "input": responses_input,
+            "reasoning": {"effort": effort_value},
+            "max_output_tokens": 16384,
+        }
+        if enable_web_search:
+            responses_params["tools"] = [{"type": "web_search_preview"}]
 
-            # Skip system messages (Responses API may not support them directly)
-            if role == "system":
-                continue
+        response = client.responses.create(**responses_params)
 
-            # Add user and assistant messages with converted content
-            if role in ["user", "assistant"]:
-                responses_input.append({"role": role, "content": content})
+        text_parts = extract_openai_responses_text(response)
+        if text_parts:
+            result = "\n".join(text_parts).strip()
+            return result if result else ""
 
-        if not responses_input:
-            return "Error: No messages found"
-
-        # Use Responses API for GPT-5.4-mini
-        try:
-            responses_params = {
-                "model": model_name,
-                "input": responses_input,
-                "reasoning": {"effort": effort_value},
-                "max_output_tokens": 4096,
-            }
-            if enable_web_search:
-                responses_params["tools"] = [{"type": "web_search_preview"}]
-            response = client.responses.create(**responses_params)
-
-            # Extract text from response - Responses API format
-            # Structure: response.output[0] -> ResponseOutputMessage -> content[0] -> ResponseOutputText -> text
-            if hasattr(response, "output") and response.output:
-                if isinstance(response.output, list) and len(response.output) > 0:
-                    # Find the message output (skip reasoning items)
-                    for output_item in response.output:
-                        # Check if it's a message type
-                        if (
-                            hasattr(output_item, "type")
-                            and output_item.type == "message"
-                        ):
-                            if hasattr(output_item, "content") and output_item.content:
-                                if isinstance(output_item.content, list):
-                                    # Extract text from all content items
-                                    text_parts = []
-                                    for content_item in output_item.content:
-                                        if (
-                                            hasattr(content_item, "type")
-                                            and content_item.type == "output_text"
-                                        ):
-                                            if hasattr(content_item, "text"):
-                                                text_parts.append(content_item.text)
-                                    if text_parts:
-                                        return "\n".join(text_parts)
-                                # Fallback: try direct text access
-                                elif hasattr(output_item.content, "text"):
-                                    return output_item.content.text
-                    # Fallback: try to find any text attribute in the output
-                    for output_item in response.output:
-                        if hasattr(output_item, "text"):
-                            return output_item.text
-            # Final fallback - return string representation
-            return str(response)
-        except Exception as e:
-            return f"Error calling Responses API: {str(e)}"
-
-    if model_name == OPENAI_MODELS["OpenAI-GPT-5.4"]:
-        # Always use Responses API for GPT-5.4
-        # When reasoning is "None", use minimum effort rather than disabling
-        effort_value = openai_effort if reasoning_effort != "None" else "low"
-
-        responses_input = []
-        for msg in openai_messages:
-            role = msg.get("role")
-            content = msg.get("content", "")
-            content = convert_chat_content_to_responses_format(content)
-            if role == "system":
-                continue
-            if role in ["user", "assistant"]:
-                responses_input.append({"role": role, "content": content})
-
-        if not responses_input:
-            return "Error: No messages found"
-
-        try:
-            responses_params = {
-                "model": model_name,
-                "input": responses_input,
-                "reasoning": {"effort": effort_value},
-                "max_output_tokens": 16384,
-            }
-            if enable_web_search:
-                responses_params["tools"] = [{"type": "web_search_preview"}]
-
-            response = client.responses.create(**responses_params)
-
-            text_parts = []
-            if hasattr(response, "output") and response.output:
-                if isinstance(response.output, list):
-                    for output_item in response.output:
-                        if hasattr(output_item, "type"):
-                            if output_item.type == "message":
-                                if hasattr(output_item, "content"):
-                                    content = output_item.content
-                                    if isinstance(content, list):
-                                        for content_item in content:
-                                            if hasattr(content_item, "type"):
-                                                if content_item.type == "output_text":
-                                                    if hasattr(content_item, "text"):
-                                                        text_parts.append(
-                                                            content_item.text
-                                                        )
-                                            elif isinstance(content_item, dict):
-                                                if (
-                                                    content_item.get("type")
-                                                    == "output_text"
-                                                    or "text" in content_item
-                                                ):
-                                                    text_parts.append(
-                                                        content_item.get("text", "")
-                                                    )
-                                            elif isinstance(content_item, str):
-                                                text_parts.append(content_item)
-                                    elif hasattr(content, "text"):
-                                        text_parts.append(content.text)
-                                    elif isinstance(content, str):
-                                        text_parts.append(content)
-                            elif hasattr(output_item, "text"):
-                                text_parts.append(output_item.text)
-                        elif isinstance(output_item, dict):
-                            if output_item.get("type") == "message":
-                                content = output_item.get("content", [])
-                                if isinstance(content, list):
-                                    for item in content:
-                                        if isinstance(item, dict) and "text" in item:
-                                            text_parts.append(item["text"])
-                                elif isinstance(content, str):
-                                    text_parts.append(content)
-                            elif "text" in output_item:
-                                text_parts.append(output_item["text"])
-
-            if text_parts:
-                result = "\n".join(text_parts).strip()
-                return result if result else ""
-
-            incomplete = getattr(response, "incomplete_details", None)
-            if incomplete is not None:
-                reason = getattr(incomplete, "reason", None) or (
-                    incomplete.get("reason")
-                    if isinstance(incomplete, dict)
-                    else "unknown"
+        incomplete = getattr(response, "incomplete_details", None)
+        if incomplete is not None:
+            reason = getattr(incomplete, "reason", None) or (
+                incomplete.get("reason") if isinstance(incomplete, dict) else "unknown"
+            )
+            if reason == "max_output_tokens":
+                return (
+                    "⚠️ Response truncated before any text was produced — reasoning "
+                    "and web search consumed the entire `max_output_tokens` budget. "
+                    "Try lowering the Reasoning Effort, disabling Web Search, or "
+                    "narrowing the question."
                 )
-                if reason == "max_output_tokens":
-                    return (
-                        "⚠️ Response truncated before any text was produced — reasoning "
-                        "and web search consumed the entire `max_output_tokens` budget. "
-                        "Try lowering the Reasoning Effort, disabling Web Search, or "
-                        "narrowing the question."
-                    )
-                return f"⚠️ Response incomplete: {reason}"
+            return f"⚠️ Response incomplete: {reason}"
 
-            return "⚠️ Model returned no text output."
-        except Exception as e:
-            return f"Error calling Responses API: {str(e)}"
+        return "⚠️ Model returned no text output."
+    except Exception as e:
+        return f"Error calling Responses API: {str(e)}"
 
-    return "Unsupported OpenAI model"
+
+def get_answer_deepseek_native(messages, pdf_contents=None, pdf_filenames=None):
+    """Call DeepSeek-V3.1 on Replicate with optional thinking mode."""
+    reasoning_effort = normalize_reasoning_effort(st.session_state.get("reasoning_effort", "low"))
+    replicate_input = {
+        "prompt": messages_to_deepseek_prompt(messages, pdf_contents, pdf_filenames),
+        "max_tokens": 8192,
+        "temperature": 0.1,
+        "top_p": 0.9,
+        "presence_penalty": 0,
+        "frequency_penalty": 0,
+    }
+    thinking = get_deepseek_thinking(reasoning_effort)
+    if thinking:
+        replicate_input["thinking"] = thinking
+
+    try:
+        output = replicate.run(DEEPSEEK_REPLICATE_MODEL, input=replicate_input)
+        result = collect_replicate_output(output)
+        return result if result else "⚠️ DeepSeek returned no text output."
+    except Exception as e:
+        return f"Error calling DeepSeek on Replicate: {str(e)}"
 
 
 def get_answer(llm, messages):
@@ -766,96 +716,54 @@ def get_answer(llm, messages):
     selected_model = st.session_state.get("selected_model", None)
 
     # Get file attachments from session state
-    file_ids, pdf_contents, pdf_filenames, image_contents, image_mime_types = (
-        get_file_attachments()
-    )
+    file_ids, pdf_contents, pdf_filenames, image_contents, image_mime_types = get_file_attachments()
 
     # Show status message if files are attached
     if file_ids or pdf_contents or image_contents:
-        file_count = (
-            len(file_ids or []) + len(pdf_contents or []) + len(image_contents or [])
+        file_count = len(file_ids or []) + len(pdf_contents or []) + len(image_contents or [])
+        st.info(f"📎 Sending {file_count} attached file(s) to {selected_model} for analysis...")
+
+    if selected_model in OPENAI_MODELS:
+        return get_answer_openai_native(
+            messages,
+            OPENAI_MODELS[selected_model],
+            enable_web_search,
+            file_ids,
+            image_contents,
+            image_mime_types,
         )
-        st.info(
-            f"📎 Sending {file_count} attached file(s) to {selected_model} for analysis..."
+
+    if is_deepseek_model(selected_model or ""):
+        return get_answer_deepseek_native(messages, pdf_contents, pdf_filenames)
+
+    if selected_model and selected_model.startswith("Claude"):
+        model_name = get_anthropic_api_model(selected_model or "")
+        if model_name:
+            return get_answer_anthropic_native(
+                messages,
+                model_name,
+                enable_web_search,
+                pdf_contents,
+                pdf_filenames,
+                image_contents,
+                image_mime_types,
+            )
+        return (
+            f"Error: Unknown Claude model '{selected_model}'. "
+            "Pick Claude Opus 5.5 or Claude Sonnet 5 in the sidebar."
         )
 
-    # GPT-5.4-mini and GPT-5.4 with reasoning always use native API (Responses API) since LangChain doesn't support it
-    reasoning_effort = st.session_state.get("reasoning_effort", "Low")
+    if llm is None:
+        return "Error: No LLM selected."
 
-    if selected_model == "OpenAI-GPT-5.4-mini":
-        model_name = OPENAI_MODELS.get(selected_model)
-        if model_name:
-            return get_answer_openai_native(
-                messages,
-                model_name,
-                enable_web_search,
-                file_ids,
-                image_contents,
-                image_mime_types,
-            )
-
-    # GPT-5.4 with reasoning must use native API (Responses API)
-    if selected_model == "OpenAI-GPT-5.4" and reasoning_effort != "None":
-        model_name = OPENAI_MODELS.get(selected_model)
-        if model_name:
-            return get_answer_openai_native(
-                messages,
-                model_name,
-                enable_web_search,
-                file_ids,
-                image_contents,
-                image_mime_types,
-            )
-
-    # Use native SDK for web search or file handling
-    if enable_web_search or file_ids or pdf_contents or image_contents:
-        if selected_model and selected_model.startswith("Claude"):
-            model_name = ANTHROPIC_MODELS.get(selected_model)
-            if model_name:
-                return get_answer_anthropic_native(
-                    messages,
-                    model_name,
-                    enable_web_search,
-                    pdf_contents,
-                    pdf_filenames,
-                    image_contents,
-                    image_mime_types,
-                )
-        elif selected_model and selected_model.startswith("OpenAI"):
-            model_name = OPENAI_MODELS.get(
-                selected_model, OPENAI_MODELS["OpenAI-GPT-4.1"]
-            )
-            return get_answer_openai_native(
-                messages,
-                model_name,
-                enable_web_search,
-                file_ids,
-                image_contents,
-                image_mime_types,
-            )
-
-    # Default: use LangChain wrapper
     answer = llm.invoke(messages)
 
-    # Handle different output formats
-    if isinstance(llm, Replicate):
-        # Replicate models return text directly or as a generator
-        if isinstance(answer, str):
-            return answer.strip()
-        elif hasattr(answer, "__iter__") and not isinstance(answer, str):
-            # If it's a generator/stream, collect all chunks
-            return "".join(str(chunk) for chunk in answer).strip()
-        else:
-            return str(answer).strip()
-    else:
-        # LangChain ChatModel returns AIMessage with content attribute
-        if hasattr(answer, "content"):
-            result = answer.content
-            return result.strip() if isinstance(result, str) else str(result).strip()
-        elif isinstance(answer, str):
-            return answer.strip()
-        else:
-            return str(answer).strip()
+    if hasattr(answer, "content"):
+        result = answer.content
+        return result.strip() if isinstance(result, str) else str(result).strip()
+    if isinstance(answer, str):
+        return answer.strip()
+    return str(answer).strip()
 
 
 def process_image_file(uploaded_file, file_content, model_str, selected_model):
@@ -880,11 +788,11 @@ def process_image_file(uploaded_file, file_content, model_str, selected_model):
     )
 
     # Store for API use if model supports it
-    if is_openai_model(model_str, selected_model) or is_anthropic_model(
-        model_str, selected_model
-    ):
+    if is_openai_model(model_str, selected_model) or is_anthropic_model(model_str, selected_model):
         st.session_state.last_image_contents.append(base64_image)
         st.session_state.last_image_mime_types.append(mime_type)
+    elif is_deepseek_model(selected_model or ""):
+        st.warning(f"{uploaded_file.name} will display in chat but DeepSeek-V3.1 cannot analyze images.")
 
     return f"📎 {uploaded_file.name} (image)"
 
@@ -907,23 +815,19 @@ def process_pdf_file(uploaded_file, file_content, model_str, selected_model):
             if file_id:
                 st.session_state.last_file_ids.append(file_id)
             else:
-                st.error(
-                    f"Failed to upload {uploaded_file.name} to OpenAI. Please try again."
-                )
+                st.error(f"Failed to upload {uploaded_file.name} to OpenAI. Please try again.")
                 user_input_prefix = f"📎 {uploaded_file.name} (upload failed)"
-    elif is_anthropic_model(model_str, selected_model):
-        with st.spinner(f"Preparing {uploaded_file.name} for Claude..."):
+    elif is_anthropic_model(model_str, selected_model) or is_deepseek_model(selected_model or ""):
+        with st.spinner(f"Preparing {uploaded_file.name}..."):
             try:
                 pdf_base64 = encode_image_to_base64(file_content)
                 st.session_state.last_pdf_contents.append(pdf_base64)
                 st.session_state.last_pdf_filenames.append(uploaded_file.name)
             except Exception as e:
-                st.error(f"Error preparing PDF for Anthropic: {str(e)}")
+                st.error(f"Error preparing PDF: {str(e)}")
                 user_input_prefix = f"📎 {uploaded_file.name} (preparation failed)"
     else:
-        st.warning(
-            "PDF support not available for this model. Please use OpenAI or Anthropic models."
-        )
+        st.warning("PDF support not available for this model. Please use OpenAI or Anthropic models.")
         user_input_prefix = f"📎 {uploaded_file.name} (PDF support not available)"
 
     return user_input_prefix
@@ -950,8 +854,6 @@ def process_uploaded_files(uploaded_files, user_input, llm):
     # If no files uploaded, only clear if we explicitly had files before
     # This allows files to persist across messages
     if not uploaded_files:
-        # Don't auto-clear files - they should persist until conversation is cleared
-        # or user explicitly removes them from the uploader
         return user_input
 
     model_str = str(type(llm))
@@ -962,7 +864,6 @@ def process_uploaded_files(uploaded_files, user_input, llm):
 
     # Check if these are the same files as before
     if current_file_ids == st.session_state.processed_files:
-        # Files haven't changed, don't reprocess - just return user input
         return user_input
 
     # Determine which files are new and which were removed
@@ -997,14 +898,10 @@ def process_uploaded_files(uploaded_files, user_input, llm):
         file_type = get_file_type(uploaded_file.name)
 
         if file_type == "image":
-            prefix = process_image_file(
-                uploaded_file, file_content, model_str, selected_model
-            )
+            prefix = process_image_file(uploaded_file, file_content, model_str, selected_model)
             prefixes.append(prefix)
         elif file_type == "pdf":
-            prefix = process_pdf_file(
-                uploaded_file, file_content, model_str, selected_model
-            )
+            prefix = process_pdf_file(uploaded_file, file_content, model_str, selected_model)
             prefixes.append(prefix)
         elif file_type == "text":
             # For text files, include content inline

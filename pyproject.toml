@@ -9,11 +9,10 @@ authors = ["Konstantin Kuteykin <konstantin.neurocreate@gmail.com>"]
 python = "^3.11"
 langchain-anthropic = "^0.3.4"
 replicate = "^1.0.7"
-langchain-openai = "^0.3.14"
 langchain-community = "^0.3.16"
 python-dotenv = "^1.0.1"
 streamlit = "^1.51.0"
-openai = "^2.6.1"
+openai = "^3.19.2"
 anthropic = "^0.71.0"
 
 [build-system]
